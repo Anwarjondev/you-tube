@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/url"
 	"os"
@@ -19,27 +18,24 @@ import (
 )
 
 const (
-	defaultMaxVideoSizeMB       = 100000
+	defaultMaxVideoSizeMB       = 50
 	defaultTimeoutSec           = 300
-	defaultLargeVideoMode       = "link"
+	defaultLargeVideoMode       = "reject"
 	bytesPerMB            int64 = 1_000_000
 	publicUploadLimitB    int64 = 2_000_000_000
-	localUploadLimitB     int64 = 2_000_000_000
 	uploadSafetyMarginB   int64 = 1_000_000
 )
 
 type config struct {
-	Token               string
-	MaxSizeMB           int64
-	MaxSizeB            int64
-	MaxUploadLimitB     int64
-	TimeoutSec          int
-	YtDlpPath           string
-	Cookies             string
-	JSRuntimes          string
-	TelegramAPIEndpoint string
-	LargeVideoMode      string
-	RequireLocalBotAPI  bool
+	Token           string
+	MaxSizeMB       int64
+	MaxSizeB        int64
+	MaxUploadLimitB int64
+	TimeoutSec      int
+	YtDlpPath       string
+	Cookies         string
+	JSRuntimes      string
+	LargeVideoMode  string
 }
 
 func main() {
@@ -52,14 +48,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	bot, activeUploadLimitB, err := createBot(cfg)
+	bot, err := tgbotapi.NewBotAPI(cfg.Token)
 	if err != nil {
 		log.Fatalf("failed to create bot: %v", err)
 	}
-	cfg.MaxUploadLimitB = activeUploadLimitB
-	if cfg.MaxSizeB > activeUploadLimitB {
-		cfg.MaxSizeB = activeUploadLimitB
-		cfg.MaxSizeMB = activeUploadLimitB / bytesPerMB
+	cfg.MaxUploadLimitB = safePublicUploadLimitB()
+	if cfg.MaxSizeB > cfg.MaxUploadLimitB {
+		cfg.MaxSizeB = cfg.MaxUploadLimitB
+		cfg.MaxSizeMB = cfg.MaxUploadLimitB / bytesPerMB
 	}
 
 	log.Printf("authorized on account: %s", bot.Self.UserName)
@@ -112,7 +108,7 @@ func main() {
 			cleanup()
 			continue
 		}
-		if cfg.LargeVideoMode == "reject" && sizeBytes > cfg.MaxSizeB {
+		if sizeBytes > cfg.MaxSizeB {
 			sizeMB := float64(sizeBytes) / float64(bytesPerMB)
 			limitMB := float64(cfg.MaxSizeB) / float64(bytesPerMB)
 			text := fmt.Sprintf("Video is too large (%.1f MB). Limit is %.0f MB.", sizeMB, limitMB)
@@ -122,26 +118,6 @@ func main() {
 		}
 
 		if err := uploadVideoWithFallback(bot, chatID, filePath); err != nil {
-			if isTooLargeUploadError(err) {
-				if splitErr := sendFileInParts(bot, chatID, filePath, cfg.MaxUploadLimitB); splitErr == nil {
-					cleanup()
-					if statusMsg.MessageID != 0 {
-						deleteMsg := tgbotapi.NewDeleteMessage(chatID, statusMsg.MessageID)
-						_, _ = bot.Request(deleteMsg)
-					}
-					continue
-				}
-			}
-
-			if cfg.LargeVideoMode == "link" && isTooLargeUploadError(err) {
-				sizeMB := float64(sizeBytes) / float64(bytesPerMB)
-				limitMB := float64(cfg.MaxUploadLimitB) / float64(bytesPerMB)
-				text := fmt.Sprintf("Downloaded video is %.1f MB, which exceeds upload limit %.0f MB on current Telegram endpoint.\n\nOpen/download from source: %s", sizeMB, limitMB, videoURL)
-				_, _ = bot.Send(tgbotapi.NewMessage(chatID, text))
-				cleanup()
-				continue
-			}
-
 			_, _ = bot.Send(tgbotapi.NewMessage(chatID, fmt.Sprintf("Upload failed: %v", err)))
 			cleanup()
 			continue
@@ -162,7 +138,7 @@ func handleCommand(bot *tgbotapi.BotAPI, msg *tgbotapi.Message) {
 	switch msg.Command() {
 	case "start", "help":
 		help := "Send me a YouTube link and I will download and send back the video file.\n\n" +
-			"If the video is too large for one upload, I will split it into parts and send all parts.\n\n" +
+			"I currently support videos up to 50 MB.\n\n" +
 			"Requirements on server:\n" +
 			"- yt-dlp installed\n" +
 			"- ffmpeg installed (recommended for merge/format conversions)"
@@ -178,11 +154,6 @@ func loadConfig() (config, error) {
 		return config{}, errors.New("TELEGRAM_BOT_TOKEN is required")
 	}
 
-	apiEndpoint := strings.TrimSpace(os.Getenv("TELEGRAM_API_ENDPOINT"))
-	if apiEndpoint != "" && strings.Count(apiEndpoint, "%s") < 2 {
-		return config{}, errors.New("TELEGRAM_API_ENDPOINT must contain two %s placeholders (token and method)")
-	}
-
 	ytDlpPath, err := resolveYtDlpPath()
 	if err != nil {
 		return config{}, err
@@ -191,9 +162,6 @@ func loadConfig() (config, error) {
 	maxMB := getEnvInt64("MAX_VIDEO_SIZE_MB", defaultMaxVideoSizeMB)
 	maxBytes := maxMB * bytesPerMB
 	maxUploadLimitB := safePublicUploadLimitB()
-	if isLocalBotAPI(apiEndpoint) {
-		maxUploadLimitB = safeLocalUploadLimitB()
-	}
 	if maxBytes > maxUploadLimitB {
 		maxBytes = maxUploadLimitB
 	}
@@ -202,83 +170,22 @@ func loadConfig() (config, error) {
 	if largeVideoMode != "reject" && largeVideoMode != "link" {
 		largeVideoMode = defaultLargeVideoMode
 	}
-	requireLocalBotAPI := strings.EqualFold(strings.TrimSpace(os.Getenv("REQUIRE_LOCAL_BOT_API")), "true")
 
 	return config{
-		Token:               token,
-		MaxSizeMB:           maxBytes / bytesPerMB,
-		MaxSizeB:            maxBytes,
-		MaxUploadLimitB:     maxUploadLimitB,
-		TimeoutSec:          timeoutSec,
-		YtDlpPath:           ytDlpPath,
-		Cookies:             strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FILE")),
-		JSRuntimes:          detectJSRuntimes(),
-		TelegramAPIEndpoint: apiEndpoint,
-		LargeVideoMode:      largeVideoMode,
-		RequireLocalBotAPI:  requireLocalBotAPI,
+		Token:           token,
+		MaxSizeMB:       maxBytes / bytesPerMB,
+		MaxSizeB:        maxBytes,
+		MaxUploadLimitB: maxUploadLimitB,
+		TimeoutSec:      timeoutSec,
+		YtDlpPath:       ytDlpPath,
+		Cookies:         strings.TrimSpace(os.Getenv("YT_DLP_COOKIES_FILE")),
+		JSRuntimes:      detectJSRuntimes(),
+		LargeVideoMode:  largeVideoMode,
 	}, nil
-}
-
-func createBot(cfg config) (*tgbotapi.BotAPI, int64, error) {
-	if cfg.TelegramAPIEndpoint != "" {
-		bot, err := tgbotapi.NewBotAPIWithAPIEndpoint(cfg.Token, cfg.TelegramAPIEndpoint)
-		if err == nil {
-			if isLocalBotAPI(cfg.TelegramAPIEndpoint) {
-				return bot, safeLocalUploadLimitB(), nil
-			}
-			return bot, safePublicUploadLimitB(), nil
-		}
-
-		if isLocalBotAPI(cfg.TelegramAPIEndpoint) {
-			if cfg.RequireLocalBotAPI {
-				if isLocalEndpointUnavailable(err) {
-					return nil, 0, fmt.Errorf("local Telegram API endpoint is unavailable (%v). Start it with ./scripts/start-local-bot-api.sh", err)
-				}
-				return nil, 0, fmt.Errorf("failed to connect to local Telegram API endpoint: %w", err)
-			}
-
-			if isLocalEndpointUnavailable(err) {
-				log.Printf("local Telegram API endpoint is unavailable (%v), falling back to public Telegram API", err)
-				bot, fallbackErr := tgbotapi.NewBotAPI(cfg.Token)
-				return bot, safePublicUploadLimitB(), fallbackErr
-			}
-			log.Printf("failed to connect to local Telegram API endpoint (%v), falling back to public Telegram API", err)
-			bot, fallbackErr := tgbotapi.NewBotAPI(cfg.Token)
-			return bot, safePublicUploadLimitB(), fallbackErr
-		}
-
-		return nil, 0, err
-	}
-	bot, err := tgbotapi.NewBotAPI(cfg.Token)
-	return bot, safePublicUploadLimitB(), err
 }
 
 func safePublicUploadLimitB() int64 {
 	return publicUploadLimitB - uploadSafetyMarginB
-}
-
-func safeLocalUploadLimitB() int64 {
-	return localUploadLimitB - uploadSafetyMarginB
-}
-
-func isLocalEndpointUnavailable(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "no such host") ||
-		strings.Contains(msg, "i/o timeout")
-}
-
-func isLocalBotAPI(apiEndpoint string) bool {
-	v := strings.ToLower(strings.TrimSpace(apiEndpoint))
-	if v == "" {
-		return false
-	}
-
-	return strings.Contains(v, "localhost") || strings.Contains(v, "127.0.0.1")
 }
 
 func detectJSRuntimes() string {
@@ -365,6 +272,7 @@ func downloadVideo(ctx context.Context, cfg config, videoURL string) (string, st
 	args := []string{
 		"--no-playlist",
 		"--restrict-filenames",
+		"--max-filesize", fmt.Sprintf("%dM", cfg.MaxSizeMB),
 		"--extractor-args", "youtube:player_client=android,web",
 		"-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
 		"--merge-output-format", "mp4",
@@ -472,101 +380,6 @@ func fileSizeBytes(path string) (int64, error) {
 func uploadVideoWithFallback(bot *tgbotapi.BotAPI, chatID int64, filePath string) error {
 	video := tgbotapi.NewVideo(chatID, tgbotapi.FilePath(filePath))
 	video.Caption = "Downloaded successfully"
-	if _, err := bot.Send(video); err == nil {
-		return nil
-	} else if !isTooLargeUploadError(err) {
-		return err
-	}
-
-	doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
-	doc.Caption = "Downloaded successfully (file)"
-	if _, err := bot.Send(doc); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func isTooLargeUploadError(err error) bool {
-	if err == nil {
-		return false
-	}
-
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "request entity too large") ||
-		strings.Contains(msg, "entity too large") ||
-		strings.Contains(msg, "file is too big") ||
-		strings.Contains(msg, "content length is too big")
-}
-
-func sendFileInParts(bot *tgbotapi.BotAPI, chatID int64, filePath string, maxPartSizeB int64) error {
-	if maxPartSizeB <= 0 {
-		return errors.New("invalid max part size")
-	}
-
-	totalSize, err := fileSizeBytes(filePath)
-	if err != nil {
-		return err
-	}
-
-	totalParts := int((totalSize + maxPartSizeB - 1) / maxPartSizeB)
-	if totalParts <= 1 {
-		return errors.New("file does not require splitting")
-	}
-
-	baseName := filepath.Base(filePath)
-	partsDir := filepath.Join(filepath.Dir(filePath), "parts")
-	if err := os.MkdirAll(partsDir, 0o755); err != nil {
-		return err
-	}
-	defer os.RemoveAll(partsDir)
-
-	src, err := os.Open(filePath)
-	if err != nil {
-		return err
-	}
-	defer src.Close()
-
-	header := fmt.Sprintf("Video is too large for single Telegram upload (%d parts).", totalParts)
-	_, _ = bot.Send(tgbotapi.NewMessage(chatID, header))
-
-	for i := 1; i <= totalParts; i++ {
-		partName := fmt.Sprintf("%s.part%03d", baseName, i)
-		partPath := filepath.Join(partsDir, partName)
-
-		partFile, err := os.Create(partPath)
-		if err != nil {
-			return err
-		}
-
-		remaining := maxPartSizeB
-		if left := totalSize - int64(i-1)*maxPartSizeB; left < remaining {
-			remaining = left
-		}
-
-		written, copyErr := io.CopyN(partFile, src, remaining)
-		closeErr := partFile.Close()
-		if copyErr != nil && !errors.Is(copyErr, io.EOF) {
-			return copyErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		if written == 0 {
-			return errors.New("failed to create split part")
-		}
-
-		doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(partPath))
-		if i == totalParts {
-			doc.Caption = fmt.Sprintf("Part %d/%d\nMerge: cat %s.part* > %s", i, totalParts, baseName, baseName)
-		} else {
-			doc.Caption = fmt.Sprintf("Part %d/%d", i, totalParts)
-		}
-
-		if _, err := bot.Send(doc); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	_, err := bot.Send(video)
+	return err
 }
